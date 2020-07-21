@@ -1,0 +1,169 @@
+本文是我新开的坑的第一篇文章，这个坑就是vue3，接下来我会围绕着vue3进行一系列的动作，包括但不限于：
+
+- 完整的源码解析
+- jsx工程最佳实践
+- 个性化的jsx方案
+- vue3生态库开发（目前有一个正在进行）
+- 以及可能的自定义一个vue3的runtime
+
+关于源码解析，网站已经上线，[vue3源码解析，最佳实践](https://vue3.w2deep.com)，网站是逐行代码形式的解析，更多关注于源码，而在掘金上分享的文章则类似于总结，会用更复合一篇文章的结构来写。如果你想持续跟进vue3源码，可以打开前面的网站关注我。
+
+那么，开始！
+
+vue3最大的变化莫过于其对于响应式原理的重构，以及其新发布的`composition api`，本文聚焦于前者，来深度剖析一下vue3中响应式到底是怎么实现的。
+
+我们以`reactive`API 为例，
+
+```js
+const Comp = {
+    setup() {
+        const state = reactive({
+            a: 'jokcy'
+        })
+        
+        return () => {
+            return <input value={state.a} onChange={(e) => state.a = e.targent.value} />
+        }
+    }
+}
+```
+
+我们看上面的例子，这个例子很简单，创建了一个组件，他有一个响应式的数据对象，然后render里面的`input`的value绑定的是`state.a`以及他的`onChange`会修改`state.a`。这是非常简单且直观的一个数据绑定的例子，而这个逻辑能实现的根本原因，是我们在调用`state.a = xxx`的时候，**vue会重新渲染我们`return`的render函数，来更新节点**
+
+而篇文章就是要来看一下，我们通过`reactive`创建的对象，到底有什么魔力，能够帮我们完成这个任务。
+
+其实本身 API 是很简单的，传入一个对象，返回一个 reactive 对象，创建的方法是`createReactiveObject`
+
+```ts
+export function reactive(target: object) {
+  // if trying to observe a readonly proxy, return the readonly version.
+  if (target && (target as Target)[ReactiveFlags.IS_READONLY]) {
+    return target;
+  }
+  return createReactiveObject(
+    target,
+    false,
+    mutableHandlers,
+    mutableCollectionHandlers
+  );
+}
+```
+
+```ts
+function createReactiveObject(
+  target: Target,
+  isReadonly: boolean,
+  baseHandlers: ProxyHandler<any>,
+  collectionHandlers: ProxyHandler<any>
+) {
+  // 前面都是一些对象是否已经proxy等的判断逻辑，这里就不展示了
+
+  const observed = new Proxy(
+    target,
+    collectionTypes.has(target.constructor) ? collectionHandlers : baseHandlers
+  );
+  def(
+    target,
+    isReadonly ? ReactiveFlags.READONLY : ReactiveFlags.REACTIVE,
+    observed
+  );
+  return observed;
+}
+```
+
+那么这里最重要的就是`new Proxy`了，可以说理解 vue3 的响应式原理过程就是理解这个`proxy`创建的过程，而了解这个过程，主要就是看第二个参数，在这里就是`collectionHandlers`或者`baseHandlers`，大部分是后者，前者主要针对，Set、Map 等。
+
+那么我们就来看`baseHandlers`：
+
+```ts
+export const mutableHandlers: ProxyHandler<object> = {
+  get,
+  set,
+  deleteProperty,
+  has,
+  ownKeys,
+};
+```
+
+可见 vue 代理了这几个操作，那么我们一个个看这几个操作做了啥：
+
+```ts
+function get(target: object, key: string | symbol, receiver: object) {
+  // ...内部key的货足
+
+  // 关于数组的一些特殊处理
+  const targetIsArray = isArray(target);
+  if (targetIsArray && hasOwn(arrayInstrumentations, key)) {
+    return Reflect.get(arrayInstrumentations, key, receiver);
+  }
+
+  // 获取请求值
+  const res = Reflect.get(target, key, receiver);
+
+  // ...如果是内部值的获取则直接返回res
+
+  if (!isReadonly) {
+    track(target, TrackOpTypes.GET, key);
+  }
+
+  // 返回的一些处理
+
+  return res;
+}
+```
+
+这里的重点就在于`track(target, TrackOpTypes.GET, key);`，这个是我们正常获取值的时候都会执行到的代码：
+
+```ts
+export function track(target: object, type: TrackOpTypes, key: unknown) {
+  if (!shouldTrack || activeEffect === undefined) {
+    return;
+  }
+  let depsMap = targetMap.get(target);
+  if (!depsMap) {
+    targetMap.set(target, (depsMap = new Map()));
+  }
+  let dep = depsMap.get(key);
+  if (!dep) {
+    depsMap.set(key, (dep = new Set()));
+  }
+  if (!dep.has(activeEffect)) {
+    dep.add(activeEffect);
+    activeEffect.deps.push(dep);
+    if (__DEV__ && activeEffect.options.onTrack) {
+      activeEffect.options.onTrack({
+        effect: activeEffect,
+        target,
+        type,
+        key,
+      });
+    }
+  }
+}
+```
+
+好了，重点来了，我们逐行分析。
+
+第一个`if`，就是根据环境变量的`shouldTrack`来判断是否要进行跟踪，如果你已经看过[我的源码解析中的`processComponent`](https://vue3.w2deep.com/source-code/process/processComponent03.html)的章节，那么你现在应该就是豁然开朗的感觉。因为在执行`processComponent`里面的`setup`的时候，我们特地关闭了`track`，而那时候就是把`shouldTrack`改为了`false`。
+
+`let depsMap = targetMap.get(target)`这行，`targetMap`是一个 map，用来记录所有的响应对象。之后如果目前没有记录该对象，那么就重新记录。
+
+这个 target 对应的也是一个 map，他会对每个 key 建立一个 set。
+
+最后要记录这次的 effect 了，这里所谓的`effect`是什么呢？就是当前正在调用这个对象的函数。在我们的例子里面，就是return回去的`render`函数，这个函数在执行的时候会调用`state.a`所以会进入`proxy`对于`get`的代理，这个时候 proxy 就调用了`track`，那么这时候的`activeEffect`就是这个 render 方法。这里的`effect`就是，当`state.a`改动的时候，我们需要重新执行该 render 方法来进行渲染。
+
+那么他是什么时候被设置的呢？在[`mount`章节](https://vue2.w2deep.com/source-code/process/processComponent03)的时候我们提到了，在执行`render`方法的时候，我们执行这样一句代码`instance.update = effect(function componentEffect()...)`，就是在这里调用的`effect`方法里面，把`activeEffect`记录为`componentEffect`，而这个`componentEffect`里面则运行了`render`方法。
+
+另外这个`getHandler`里面有句代码也挺有意思的：
+
+```ts
+if (isObject(res)) {
+  return isReadonly ? readonly(res) : reactive(res);
+}
+```
+
+在获取属性的时候，如果返回的值是对象的时候，才会对其执行`reactive`，这也就是延迟处理，而且`readonly`的话是不执行`reactive`的。
+
+OK，到这里我们已经知道了在执行`render`函数的时候，因为我们调用了`state.a`所以这个函数就相当于依赖`state.a`，这在vue3里面被称为`effect`。
+
+那么下一篇文章，我们就来讲一讲，这些`effect`在`state.a`变动的时候是如何被调用的，敬请期待。
